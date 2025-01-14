@@ -1,7 +1,10 @@
 <?php
 
+// SAMPLE usage: php bonita_calculator.php [--force-fresh-bpej-cache]
+
 require_once(dirname(__FILE__).'/apikey.secret.php');
 
+$rawKNData = null;
 $KodKatastralnihoUzemi = 0;
 
 /**
@@ -15,41 +18,15 @@ $parcels = [];
 // this redefines the ku and parcels so its not pushed to git
 require_once(dirname(__FILE__).'/parcels.php');
 
+// ============== CLI ARGUMENT PARSING ==============
+$forceFresh = in_array('--force-fresh-bpej-cache', $argv, true);
+
+
+
+
 
 /**
- * Handle $parcels, which can be string or array:
- * - if string, explode by newlines, trim, discard empties.
- * - if array, just keep it as-is.
- */
-if (is_string($parcels)) {
-    $lines = explode("\n", $parcels);
-    $filtered = [];
-    foreach ($lines as $line) {
-        $line = trim($line);
-        if ($line !== '') {
-            $filtered[] = $line;
-        }
-    }
-    $parcels = $filtered;
-} elseif (!is_array($parcels)) {
-    // Fall back to empty array if it's neither string nor array
-    $parcels = [];
-}
-
-// Summaries
-$totalSqm = 0;                // overall summed area
-$bpejSums = [];               // BPEJ code -> total sqm
-$lvs = [];                    // track all LV numbers
-$bpejPrices = [];             // BPEJ code -> price per sqm
-$parcelsWithoutBpej = [];     // track parcels that have no BPEJ
-
-/**
- * Simple cURL GET helper
- *
- * @param string $url
- * @param string[] $headers
- * @param string|null $userAgent
- * @return string|null
+ * cURL GET helper
  */
 function curlGetContents(string $url, array $headers = [], ?string $userAgent = null): ?string
 {
@@ -71,13 +48,226 @@ function curlGetContents(string $url, array $headers = [], ?string $userAgent = 
     $error = curl_error($ch);
     curl_close($ch);
 
-    if ($error) {
-        return null;
-    }
-    return $response;
+    return $error ? null : $response;
 }
 
-// 1) Query each parcel from the KN API
+/**
+ * Parse $rawKNData to get 'katastralniUzemiName', 'katastralniUzemiCode', 'parcels'
+ */
+function parseRawKNData(string $rawKNData): array
+{
+    $results = [
+        'katastralniUzemiName' => null,
+        'katastralniUzemiCode' => null,
+        'parcels' => [],
+    ];
+
+    $lines = preg_split('/\r\n|\r|\n/', $rawKNData);
+    if (!$lines) {
+        return $results;
+    }
+
+    // match "Katastrální území: Something [123456]"
+    foreach ($lines as $line) {
+        $lineTrim = trim($line);
+        if (preg_match('/Katastrální\s+území\s*:\s*(.+?)\[(\d+)\]/u', $lineTrim, $matches)) {
+            $results['katastralniUzemiName'] = trim($matches[1]);
+            $results['katastralniUzemiCode'] = (int)$matches[2];
+            break;
+        }
+    }
+
+    // find "Parcelní číslo" line, collect subsequent lines that are "digits" or "digits/digits"
+    $collecting = false;
+    foreach ($lines as $line) {
+        $lineTrim = trim($line);
+        if (!$collecting && stripos($lineTrim, 'Parcelní číslo') !== false) {
+            $collecting = true;
+            continue;
+        }
+        if ($collecting) {
+            if (empty($lineTrim)) {
+                break;
+            }
+            if (preg_match('/^\d+(\/\d+)?$/', $lineTrim)) {
+                $results['parcels'][] = $lineTrim;
+            } else {
+                break;
+            }
+        }
+    }
+
+    return $results;
+}
+
+/**
+ * Load BPEJ JSON cache from local file
+ */
+function loadBpejCacheFile(string $filePath): ?array
+{
+    if (!file_exists($filePath)) {
+        return null;
+    }
+    $contents = file_get_contents($filePath);
+    if (!$contents) {
+        return null;
+    }
+    $arr = json_decode($contents, true);
+    if (!is_array($arr)) {
+        return null;
+    }
+    return $arr;
+}
+
+/**
+ * Compute SHA256 sum of a file
+ */
+function sha256File(string $filePath): ?string
+{
+    if (!file_exists($filePath)) {
+        return null;
+    }
+    return hash_file('sha256', $filePath);
+}
+
+// ============== PARSE $rawKNData IF PROVIDED ==============
+if (!empty($rawKNData)) {
+    $parsed = parseRawKNData($rawKNData);
+    $knName = $parsed['katastralniUzemiName'];
+    $knCode = $parsed['katastralniUzemiCode'];
+    $knParcels = $parsed['parcels'];
+
+    if ($knCode && $knParcels) {
+        echo "Detected from raw KN Data:\n";
+        echo " - Katastrální území: {$knName} [{$knCode}]\n";
+        echo " - Parcels:\n";
+        foreach ($knParcels as $p) {
+            echo "    {$p}\n";
+        }
+
+        // ask user if to proceed
+        while (true) {
+            echo "Do you want to proceed? [Y/n] ";
+            $answer = trim(fgets(STDIN));
+            if ($answer === '' || strcasecmp($answer, 'y') === 0) {
+                // proceed
+                break;
+            } elseif (strcasecmp($answer, 'n') === 0) {
+                echo "Exiting.\n";
+                exit(0);
+            } else {
+                echo "Please enter 'Y' or 'n'.\n";
+            }
+        }
+
+        // override
+        $KodKatastralnihoUzemi = $knCode;
+        $parcels = $knParcels;
+    } else {
+        echo "WARNING: Could not parse a valid katastrální území or parcels from raw KN Data.\n";
+        echo "Falling back to default vars.\n";
+    }
+}
+
+// In case $parcels is still a string, parse line by line
+if (is_string($parcels)) {
+    $lines = explode("\n", $parcels);
+    $filtered = [];
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if ($line !== '') {
+            $filtered[] = $line;
+        }
+    }
+    $parcels = $filtered;
+}
+
+// ============== BPEJ CACHE HANDLING ==============
+// ask "Use local BPEJ cache file?" [Y/n]
+echo "Do you want to use bpej.json cache file? [Y/n] ";
+$useCacheAnswer = 'y'; // default
+$readAnswer = trim(fgets(STDIN));
+if ($readAnswer !== '') {
+    $useCacheAnswer = $readAnswer;
+}
+
+$useLocalBpejCache = (strcasecmp($useCacheAnswer, 'n') !== 0);
+
+$bpejCache = [];
+if ($useLocalBpejCache) {
+    $cacheFilePath = __DIR__ . '/bpej.json';
+    $fileExists = file_exists($cacheFilePath);
+    if ($fileExists) {
+        $modifiedTime = filemtime($cacheFilePath);
+        $formattedTime = date('Y-m-d H:i:s', $modifiedTime);
+        echo "bpej.json last modified: {$formattedTime}\n";
+    } else {
+        echo "bpej.json file is missing.\n";
+    }
+
+    if ($fileExists) {
+        $strNow = time();
+        $isOlderThan24h = ($strNow - $modifiedTime) > (24 * 3600);
+        if (!$forceFresh && !$isOlderThan24h) {
+            // If not forcing AND not older than 24hr, do nothing
+            echo "bpej.json is newer than 24 hours, no update needed.\n";
+        } else {
+            // Either forced or older than 24hr
+            // ask user if not forced
+            if (!$forceFresh && $isOlderThan24h) {
+                echo "bpej.json is older than 24 hours. Update? [Y/n] ";
+                $updAnswer = trim(fgets(STDIN));
+                if ($updAnswer === '' || strcasecmp($updAnswer, 'y') === 0) {
+                    // do update
+                } else {
+                    echo "Skipping refresh, continuing with old file.\n";
+                    goto loadBpejFile;
+                }
+            }
+
+            // do forced update or user accepted update
+            // compute old hash
+            $oldHash = sha256File($cacheFilePath) ?? '(none)';
+            echo "Fetching new bpej.json...\n";
+            // run "php bpej_fetch.php" from same dir
+            $cmd = 'php "' . __DIR__ . '/bpej_fetch.php"';
+            exec($cmd, $outLines, $retCode);
+            if ($retCode !== 0) {
+                echo "Error running bpej_fetch.php, code={$retCode}\n";
+            } else {
+                echo "bpej_fetch.php finished.\n";
+                $newHash = sha256File($cacheFilePath) ?? '(none)';
+                if ($oldHash === $newHash) {
+                    echo "No changes in bpej.json file (hash is the same).\n";
+                } else {
+                    echo "bpej.json has changed (old sha256={$oldHash}, new sha256={$newHash}).\n";
+                }
+            }
+        }
+    } else {
+        // file does not exist, must fetch
+        echo "bpej.json file missing, fetching now...\n";
+        $cmd = 'php "' . __DIR__ . '/bpej_fetch.php"';
+        exec($cmd, $outLines, $retCode);
+        if ($retCode !== 0) {
+            echo "Error running bpej_fetch.php, code={$retCode}.\n";
+        } else {
+            echo "bpej_fetch.php finished.\n";
+        }
+    }
+
+    loadBpejFile:
+    // load the bpej.json file (if it exists now)
+    $bpejCache = loadBpejCacheFile($cacheFilePath) ?? [];
+    echo "Loaded " . count($bpejCache) . " BPEJ codes from local cache.\n";
+}
+
+// ============== PARCEL QUERIES ==============
+$totalSqm = 0;
+$bpejSums = [];
+$lvs = [];
+$parcelsWithoutBpej = [];
+
 $index = 0;
 $count = count($parcels);
 
@@ -85,18 +275,17 @@ foreach ($parcels as $parcel) {
     $index++;
     echo "Querying parcel {$index}/{$count}: {$parcel}\n";
 
-    // parse "kmenoveCislo/poddeleni" or "kmenoveCislo"
+    // parse "XX" or "XX/YY"
     $kmenove = 0;
     $poddeleni = null;
     if (strpos($parcel, '/') !== false) {
-        list($kmenoveString, $poddeleniString) = explode('/', $parcel, 2);
-        $kmenove = (int)$kmenoveString;
-        $poddeleni = (int)$poddeleniString;
+        list($kmenoveStr, $poddeleniStr) = explode('/', $parcel, 2);
+        $kmenove = (int)$kmenoveStr;
+        $poddeleni = (int)$poddeleniStr;
     } else {
         $kmenove = (int)$parcel;
     }
 
-    // Build URL
     $baseUrl = 'https://api-kn.cuzk.gov.cz/api/v1/Parcely/Vyhledani';
     $queryParams = [
         'KodKatastralnihoUzemi' => $KodKatastralnihoUzemi,
@@ -107,33 +296,28 @@ foreach ($parcels as $parcel) {
     if ($poddeleni > 0) {
         $queryParams['PoddeleniCislaParcely'] = $poddeleni;
     }
-
     $url = $baseUrl . '?' . http_build_query($queryParams);
 
-    // cURL request
     $response = curlGetContents($url, ['ApiKey: ' . APIKEY]);
     if (!$response) {
-        echo "Error fetching data for parcel: {$parcel}\n";
-        continue;
+        echo "Fatal error: Could not fetch data from Katastr for parcel: {$parcel}\n";
+        exit(1);
     }
 
     $json = json_decode($response);
     if (!isset($json->data) || !is_array($json->data) || count($json->data) === 0) {
-        echo "No data found for parcel: {$parcel}\n";
-        continue;
+        echo "Fatal error: No data found for parcel: {$parcel}\n";
+        exit(1);
     }
 
-    // Generally expect a single item in "data"
     $parcelData = $json->data[0];
     $vymera = $parcelData->vymera ?? 0;
     $totalSqm += $vymera;
 
-    // store LV
     if (isset($parcelData->lv->cislo)) {
         $lvs[] = $parcelData->lv->cislo;
     }
 
-    // handle BPEJ
     if (!empty($parcelData->bpej)) {
         foreach ($parcelData->bpej as $bpejItem) {
             $bpejCode = $bpejItem->kod;
@@ -144,87 +328,115 @@ foreach ($parcels as $parcel) {
             $bpejSums[$bpejCode] += $bpejArea;
         }
     } else {
-        // parcels with no BPEJ
         $druhPozemku = $parcelData->druhPozemku->nazev ?? 'Unknown type';
         $parcelsWithoutBpej[] = [
-            'parcelName' => $parcel,   // e.g. "1391/21"
+            'parcelName' => $parcel,
             'vymera' => $vymera,
             'druhPozemku' => $druhPozemku
         ];
     }
 }
 
-// 2) Fetch BPEJ prices
-$bpejCodes = array_keys($bpejSums);
+// ============== PART 2B: GET BPEJ PRICES ==============
+$bpejPrices = []; // final code => price
+$allBpejCodes = array_keys($bpejSums);
 $index = 0;
-$count = count($bpejCodes);
+$count = count($allBpejCodes);
 
-foreach ($bpejCodes as $code) {
+foreach ($allBpejCodes as $bpejCode) {
     $index++;
-    echo "Fetching BPEJ price ({$index}/{$count}): {$code}\n";
-    $bpejUrl = "https://bpej.vumop.cz/{$code}";
+    echo "Determining price for BPEJ code ({$index}/{$count}): {$bpejCode}\n";
 
-    // Spoof user agent
-    $html = curlGetContents($bpejUrl, [], 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36');
-    if (!$html) {
-        echo "Error fetching BPEJ price for code: {$code}\n";
-        $bpejPrices[$code] = 0;
+    // If $bpejCode is in $bpejCache, use it
+    // If not, infinite retry
+    if ($useLocalBpejCache && array_key_exists($bpejCode, $bpejCache)) {
+        $bpejPrices[$bpejCode] = (float)$bpejCache[$bpejCode];
+        echo "  Using cached price: " . $bpejPrices[$bpejCode] . "\n";
         continue;
     }
 
-    // We'll capture the line with "Základní cena pozemků [Kč/m<sup>2</sup>]" and then parse out:
-    // <span class="badge cenaXkat bvBadge">PRICE</span>
+    // fallback infinite retry from bpej.vumop.cz
+    $attempt = 0;
     $price = 0.0;
-    $lines = explode("\n", $html);
-    foreach ($lines as $line) {
-        if (strpos($line, '<b>Základní cena pozemků [Kč/m<sup>2</sup>]') !== false) {
-            // Pattern: <span ...>15.60</span>
-            if (preg_match('/<span[^>]*>([0-9]+(\.[0-9]+)?)<\/span>/', $line, $matches)) {
-                $price = floatval($matches[1]);
-                break;
+
+    while (true) {
+        $attempt++;
+        echo "  Attempt #{$attempt} for BPEJ code {$bpejCode}\n";
+
+        $bpejUrl = "https://bpej.vumop.cz/{$bpejCode}";
+        $html = curlGetContents(
+            $bpejUrl,
+            [],
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+        );
+
+        if (!$html) {
+            echo "  Error fetching BPEJ data from website, sleeping 5 seconds and retrying...\n";
+            sleep(5);
+            continue;
+        }
+
+        $foundPrice = false;
+        $lines = explode("\n", $html);
+        foreach ($lines as $line) {
+            if (strpos($line, '<b>Základní cena pozemků [Kč/m<sup>2</sup>]') !== false) {
+                if (preg_match('/<span[^>]*>([0-9]+(\.[0-9]+)?)<\/span>/', $line, $matches)) {
+                    $price = floatval($matches[1]);
+                    $foundPrice = true;
+                    break;
+                }
             }
         }
+
+        if (!$foundPrice) {
+            echo "  Could not parse BPEJ price from HTML, sleeping 5 seconds and retrying...\n";
+            sleep(5);
+            continue;
+        }
+
+        break;
     }
 
-    $bpejPrices[$code] = $price;
+    $bpejPrices[$bpejCode] = $price;
+    echo "  Price found: {$price}\n";
 }
 
-// 3) Summaries
+// ============== PART 3: SUMMARIES ==============
 echo "\n=== Final Results ===\n\n";
 echo "Total square meters across all parcels: {$totalSqm}\n\n";
 
 $weightedSum = 0.0;
 echo "BPEJ breakdown:\n";
-foreach ($bpejSums as $bpejCode => $sqm) {
-    $price = $bpejPrices[$bpejCode] ?? 0;
+foreach ($bpejSums as $code => $sqm) {
+    $price = $bpejPrices[$code] ?? 0;
     $partial = $sqm * $price;
     $weightedSum += $partial;
-    echo " - BPEJ {$bpejCode}: {$sqm} sqm, price: {$price} Kč/m2, partial sum = {$partial}\n";
+    echo " - BPEJ {$code}: {$sqm} sqm, price: {$price} Kč/m2, partial sum = {$partial}\n";
 }
 
-// 4) Average BPEJ Price (rounded to 2 decimals)
-$averageBpejPrice = 0;
+// average
+$averageBpejPrice = 0.0;
 if ($totalSqm > 0) {
     $averageBpejPrice = $weightedSum / $totalSqm;
 }
 $averageBpejPrice = round($averageBpejPrice, 2);
 echo "\nAverage BPEJ price: {$averageBpejPrice} Kč/m2\n";
 
-// 5) Parcels without BPEJ
+// parcels without BPEJ
 if (!empty($parcelsWithoutBpej)) {
     echo "\nParcels without BPEJ:\n";
     $totalNoBpej = 0;
     foreach ($parcelsWithoutBpej as $pData) {
         $parcelName = $pData['parcelName'];
         $vymera = $pData['vymera'];
-        $druhPozemku = $pData['druhPozemku'];
+        $druh = $pData['druhPozemku'];
         $totalNoBpej += $vymera;
-        echo " - {$parcelName}: {$vymera} sqm, {$druhPozemku}\n";
+        echo " - {$parcelName}: {$vymera} sqm, {$druh}\n";
     }
     echo "Total area of parcels without BPEJ: {$totalNoBpej} sqm\n";
 }
 
-// 6) LV info
+// LV info
 $uniqueLvs = array_unique($lvs);
 if (count($uniqueLvs) === 1) {
     echo "\nAll parcels have the same LV: " . reset($uniqueLvs) . "\n";
@@ -234,12 +446,10 @@ if (count($uniqueLvs) === 1) {
     echo "\nNo LV detected.\n";
 }
 
-// 7) Excel bonita calculation: =((area1*price1)+(area2*price2)+...)/totalArea
-// Using BPEJ sums. Example: =((1204*13.3)+(1293*5.50))/97623
+// excel formula
 $excelParts = [];
-foreach ($bpejSums as $bpejCode => $sqm) {
-    $price = $bpejPrices[$bpejCode] ?? 0;
-    // format at least for decimal conversion
+foreach ($bpejSums as $code => $sqm) {
+    $price = $bpejPrices[$code] ?? 0;
     $excelParts[] = "({$sqm}*{$price})";
 }
 if ($totalSqm > 0 && !empty($excelParts)) {
@@ -248,3 +458,5 @@ if ($totalSqm > 0 && !empty($excelParts)) {
 } else {
     echo "\nExcel bonita calculation: (No BPEJ data)\n";
 }
+
+echo "\nDone.\n";

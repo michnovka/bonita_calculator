@@ -319,8 +319,9 @@ foreach ($parcels as $parcel) {
     }
 
     if (!empty($parcelData->bpej)) {
+
         foreach ($parcelData->bpej as $bpejItem) {
-            $bpejCode = $bpejItem->kod;
+            $bpejCode = str_pad($bpejItem->kod, 5, '0', STR_PAD_LEFT);
             $bpejArea = $bpejItem->vymera ?? 0;
             if (!isset($bpejSums[$bpejCode])) {
                 $bpejSums[$bpejCode] = 0;
